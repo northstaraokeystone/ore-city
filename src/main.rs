@@ -1,7 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3;
@@ -20,10 +20,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 static FOREST: Lazy<Result<EmpireForest>> =
     Lazy::new(|| EmpireForest::from_file("data/red-loop.yaml"));
 
-static DRIFT_TRACKER: Lazy<Mutex<DriftTracker>> =
-    Lazy::new(|| Mutex::new(DriftTracker::new()));
-
-const SLO_THRESHOLD: f64 = 0.92;
+const ECI_THRESHOLD: f64 = 0.92;
 const MIX_PHRASE: &str = "BABY GOT BACK LOOP";
 const MIX_ANAGRAM: &str = "TAL B. MAXI";
 const GLYPH_PATH: &str = "glyphs/entropy-anchor.svg";
@@ -120,37 +117,34 @@ struct EntangledEdge {
     score: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Orbit {
+    Vin,
+    Optimus,
+    Hull,
+    Bioreactor,
+    Deluge,
+    Doge,
+    Neuralink,
+    Starlink,
+    Xai,
+    Doodle,
+    Mars,
+    Aux,
+}
+
 #[derive(Debug)]
 struct EmpireForest {
     claims: Vec<Claim>,
     root: [u8; 32],
     sparse_root: [u8; 32],
-    slo: f64,
-    drift: f64,
-    avg_drift: f64,
+    eci: f64,
+    c_orbit: f64,
+    c_bridge: f64,
+    c_mesh: f64,
+    c_guard: f64,
+    margin: f64,
     edges: Vec<EntangledEdge>,
-}
-
-#[derive(Debug)]
-struct DriftTracker {
-    total: f64,
-    samples: u64,
-}
-
-impl DriftTracker {
-    fn new() -> Self {
-        Self { total: 0.0, samples: 0 }
-    }
-
-    fn record(&mut self, drift: f64) -> f64 {
-        self.total += drift;
-        self.samples += 1;
-        if self.samples == 0 {
-            0.0
-        } else {
-            self.total / self.samples as f64
-        }
-    }
 }
 
 // EmpireSigner trait for hot-swap
@@ -183,7 +177,6 @@ impl EmpireSigner for Ed25519Signer {
         if sig.len() != SIGNATURE_LENGTH {
             return false;
         }
-        // Signature::try_from(&[u8]) is available in ed25519-dalek 2.x
         let sig = match Signature::try_from(sig) {
             Ok(s) => s,
             Err(_) => return false,
@@ -198,7 +191,6 @@ struct DilithiumSigner; // PQ stub
 #[cfg(feature = "pq")]
 impl EmpireSigner for DilithiumSigner {
     fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        // Stub: BLAKE3 as proxy for Dilithium sig
         blake3::hash(msg).as_bytes().to_vec()
     }
 
@@ -220,12 +212,11 @@ impl EmpireSigner for HybridSigner {
         let ed_sig = self.ed.sign(msg);
         #[cfg(feature = "pq")]
         let pq_sig = self.pq.sign(msg);
-
         #[cfg(not(feature = "pq"))]
         let pq_sig: Vec<u8> = blake3::hash(msg).as_bytes().to_vec();
 
         let mut combined = Vec::with_capacity(ed_sig.len() + pq_sig.len() + 1);
-        combined.push(0x02); // Hybrid prefix
+        combined.push(0x02);
         combined.extend(ed_sig);
         combined.extend(pq_sig);
         combined
@@ -234,24 +225,21 @@ impl EmpireSigner for HybridSigner {
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
         if sig.is_empty() || sig[0] != 0x02 {
             return false;
-        } else {
-            let (ed_len, _pq_start) = (64, sig.len().saturating_sub(32)); // Fixed sizes for stub
-            if sig.len() < 1 + ed_len {
-                return false;
-            } else {
-                let ed_sig = &sig[1..1 + ed_len];
-                let pq_sig = &sig[1 + ed_len..];
-                let ed_ok = self.ed.verify(msg, ed_sig);
-
-                #[cfg(feature = "pq")]
-                let pq_ok = self.pq.verify(msg, pq_sig);
-
-                #[cfg(not(feature = "pq"))]
-                let pq_ok = blake3::hash(msg).as_bytes() == pq_sig;
-
-                ed_ok && pq_ok
-            }
         }
+        let ed_len = SIGNATURE_LENGTH;
+        if sig.len() < 1 + ed_len {
+            return false;
+        }
+        let ed_sig = &sig[1..1 + ed_len];
+        let pq_sig = &sig[1 + ed_len..];
+        let ed_ok = self.ed.verify(msg, ed_sig);
+
+        #[cfg(feature = "pq")]
+        let pq_ok = self.pq.verify(msg, pq_sig);
+        #[cfg(not(feature = "pq"))]
+        let pq_ok = blake3::hash(msg).as_bytes() == pq_sig;
+
+        ed_ok && pq_ok
     }
 }
 
@@ -290,8 +278,12 @@ fn real_main() -> Result<()> {
 
 fn cmd_default() -> Result<()> {
     let forest = forest()?;
-    if forest.slo < SLO_THRESHOLD {
-        return Err(format!("SLO breach {:.4} < {:.4}", forest.slo, SLO_THRESHOLD).into());
+    if forest.eci < ECI_THRESHOLD {
+        return Err(format!(
+            "ECI {:.4} below threshold {:.4}",
+            forest.eci, ECI_THRESHOLD
+        )
+        .into());
     }
     verify_forest(forest)?;
     pulse_glyph(forest);
@@ -306,12 +298,19 @@ fn cmd_default() -> Result<()> {
 fn cmd_verify() -> Result<()> {
     let forest = forest()?;
     verify_forest(forest)?;
-    // Add uncle proofs for transitive edges
     for edge in &forest.edges {
         if let Some(from_leaf) = forest.claims.iter().find(|c| c.id == edge.from) {
             if let Some(to_leaf) = forest.claims.iter().find(|c| c.id == edge.to) {
-                let from_idx = forest.claims.iter().position(|c| c.id == edge.from).unwrap();
-                let to_idx = forest.claims.iter().position(|c| c.id == edge.to).unwrap();
+                let from_idx = forest
+                    .claims
+                    .iter()
+                    .position(|c| c.id == edge.from)
+                    .unwrap();
+                let to_idx = forest
+                    .claims
+                    .iter()
+                    .position(|c| c.id == edge.to)
+                    .unwrap();
                 let leaves: Vec<[u8; 32]> = forest
                     .claims
                     .iter()
@@ -336,12 +335,15 @@ fn cmd_verify() -> Result<()> {
         }
     }
     println!(
-        "verify: root={} sparse_root={} slo={:.4} drift={:.6} avg_drift={:.6}",
+        "verify: root={} sparse_root={} eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
         hex::encode(forest.root),
         hex::encode(forest.sparse_root),
-        forest.slo,
-        forest.drift,
-        forest.avg_drift
+        forest.eci,
+        forest.c_orbit,
+        forest.c_bridge,
+        forest.c_mesh,
+        forest.c_guard,
+        forest.margin
     );
     Ok(())
 }
@@ -353,8 +355,8 @@ fn cmd_receipt(full: bool) -> Result<()> {
     println!("root={}", hex::encode(forest.root));
     println!("sparse_root={}", hex::encode(forest.sparse_root));
     println!(
-        "slo={:.4} drift={:.6} avg_drift={:.6}",
-        forest.slo, forest.drift, forest.avg_drift
+        "eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
+        forest.eci, forest.c_orbit, forest.c_bridge, forest.c_mesh, forest.c_guard, forest.margin
     );
     if full {
         for c in &forest.claims {
@@ -376,14 +378,14 @@ fn cmd_anchor() -> Result<()> {
     let forest = forest()?;
     write_anchor_svg(forest)?;
     println!(
-        "anchor: glyph at {} color={} slo={:.4}",
+        "anchor: glyph at {} color={} eci={:.4}",
         GLYPH_PATH,
-        if forest.slo >= SLO_THRESHOLD {
+        if forest.eci >= ECI_THRESHOLD {
             "NS_GOLD"
         } else {
             "muted"
         },
-        forest.slo
+        forest.eci
     );
     Ok(())
 }
@@ -402,11 +404,10 @@ fn cmd_mars() -> Result<()> {
         last + offset,
         years
     );
-    // RTT histogram as leaves with epoch pinning
     let mut buckets = [0_u64; 8];
     for (i, c) in forest.claims.iter().enumerate() {
         let idx = (i % buckets.len()) as usize;
-        let pinned_epoch = c.epoch + offset; // Commitment offset
+        let pinned_epoch = c.epoch + offset;
         buckets[idx] += (c.metrics.first().cloned().unwrap_or(1.0).abs() * 1000.0) as u64;
         println!(
             "mars leaf {}: epoch pinned to {}, rtt_ms approx {}",
@@ -414,10 +415,9 @@ fn cmd_mars() -> Result<()> {
         );
     }
     println!("mars: RTT histogram leaves (ms-ish): {:?}", buckets);
-    // Entanglement check stub
-    let entanglement = forest.slo; // Proxy for ≥0.92
-    println!("mars entanglement SLO: {:.4}", entanglement);
-    if entanglement < 0.92 {
+    let entanglement = forest.eci;
+    println!("mars entanglement ECI: {:.4}", entanglement);
+    if entanglement < ECI_THRESHOLD {
         return Err("mars entanglement below 0.92 - no pinning".into());
     }
     Ok(())
@@ -431,7 +431,6 @@ fn cmd_swarm(agents: u32) -> Result<()> {
     let mut hasher = blake3::Hasher::new();
     let buf_template = Vec::with_capacity(64);
 
-    // Parallel stub with std::thread for BLAKE3 update
     use std::thread;
     let mut handles = Vec::with_capacity(n as usize);
     for i in 0..n {
@@ -439,15 +438,15 @@ fn cmd_swarm(agents: u32) -> Result<()> {
         let root_copy = forest.root;
         let mut local_buf = buf_template.clone();
         let idx = i;
-let handle = thread::spawn(move || {
-    local_buf.clear();
-    local_buf.extend_from_slice(&root_copy);
-    local_buf.extend_from_slice(label.as_bytes());
-    local_buf.extend_from_slice(&idx.to_le_bytes());
-    let h = blake3::hash(&local_buf);
-    let role = swarm_role(&label);
-    (h, label, role)
-});
+        let handle = thread::spawn(move || {
+            local_buf.clear();
+            local_buf.extend_from_slice(&root_copy);
+            local_buf.extend_from_slice(label.as_bytes());
+            local_buf.extend_from_slice(&idx.to_le_bytes());
+            let h = blake3::hash(&local_buf);
+            let role = swarm_role(&label);
+            (h, label, role)
+        });
         handles.push(handle);
     }
 
@@ -608,25 +607,348 @@ impl EmpireForest {
         let root = merkle.root().ok_or("no merkle root")?;
 
         let sparse_root = sparse_forest_root(&leaves);
-        let (drift, slo) = compute_drift(&claims);
-        let avg = {
-            let mut guard = DRIFT_TRACKER.lock().map_err(|_| "drift tracker poisoned")?;
-            guard.record(drift)
-        };
-        if slo < SLO_THRESHOLD {
-            return Err(format!("SLO {:.4} below threshold {:.4}", slo, SLO_THRESHOLD).into());
-        }
         let edges = entangle_edges(&claims);
+        let (eci, c_orbit, c_bridge, c_mesh, c_guard, margin) = compute_eci(&claims, &edges);
+
+        if eci < ECI_THRESHOLD {
+            return Err(format!("ECI {:.4} below threshold {:.4}", eci, ECI_THRESHOLD).into());
+        }
+
         Ok(EmpireForest {
             claims,
             root,
             sparse_root,
-            slo,
-            drift,
-            avg_drift: avg,
+            eci,
+            c_orbit,
+            c_bridge,
+            c_mesh,
+            c_guard,
+            margin,
             edges,
         })
     }
+}
+
+fn orbit_for_claim(c: &Claim) -> Orbit {
+    match c.id {
+        1..=5 => Orbit::Vin,
+        6..=10 => Orbit::Optimus,
+        11..=14 => Orbit::Hull,
+        15..=18 => Orbit::Bioreactor,
+        19..=22 => Orbit::Deluge,
+        23 => Orbit::Doge,
+        24..=26 => Orbit::Neuralink,
+        27..=30 => Orbit::Starlink,
+        31..=35 => Orbit::Xai,
+        36..=38 => Orbit::Doodle,
+        39..=42 => Orbit::Mars,
+        _ => match c.kind {
+            ClaimKind::Physical => Orbit::Aux,
+            ClaimKind::Digital => Orbit::Aux,
+            ClaimKind::CrossAnchor => Orbit::Aux,
+        },
+    }
+}
+
+fn orbit_weight(orbit: Orbit) -> f64 {
+    match orbit {
+        Orbit::Vin
+        | Orbit::Optimus
+        | Orbit::Hull
+        | Orbit::Bioreactor
+        | Orbit::Deluge
+        | Orbit::Starlink
+        | Orbit::Mars => 1.0,
+        Orbit::Neuralink | Orbit::Xai => 0.8,
+        Orbit::Doge | Orbit::Doodle => 0.6,
+        Orbit::Aux => 0.5,
+    }
+}
+
+fn saturate_orbit(raw: f64) -> f64 {
+    let r = raw.clamp(0.0, 1.0);
+    if r <= 0.7 {
+        r * 0.8
+    } else if r <= 0.95 {
+        r
+    } else {
+        0.95 + (r - 0.95) * 0.1
+    }
+}
+
+fn saturate_bridge(raw: f64) -> f64 {
+    let r = raw.clamp(0.0, 1.0);
+    if r <= 0.8 {
+        r * 0.9
+    } else if r <= 0.95 {
+        r
+    } else {
+        0.95 + (r - 0.95) * 0.1
+    }
+}
+
+fn cos_sim(a: &[f32], b: &[f32]) -> f64 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 1.0;
+    }
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for i in 0..len {
+        let ai = a[i] as f64;
+        let bi = b[i] as f64;
+        dot += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
+    let na = norm_a.sqrt();
+    let nb = norm_b.sqrt();
+    if na > 0.0 && nb > 0.0 {
+        (dot / (na * nb)).clamp(-1.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn cos_sim_slice(a: &[f32], b: &[f32]) -> f64 {
+    cos_sim(a, b)
+}
+
+fn compute_eci(claims: &[Claim], edges: &[EntangledEdge]) -> (f64, f64, f64, f64, f64, f64) {
+    let n = claims.len();
+    if n == 0 {
+        return (1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+    }
+
+    let mut orbit_indices: HashMap<Orbit, Vec<usize>> = HashMap::new();
+    let mut claim_orbit: Vec<Orbit> = Vec::with_capacity(n);
+    let mut id_to_index: HashMap<u32, usize> = HashMap::with_capacity(n);
+
+    for (idx, c) in claims.iter().enumerate() {
+        let o = orbit_for_claim(c);
+        claim_orbit.push(o);
+        orbit_indices.entry(o).or_default().push(idx);
+        id_to_index.insert(c.id, idx);
+    }
+
+    let mut orbit_scores: HashMap<Orbit, f64> = HashMap::new();
+    let mut orbit_centroids: HashMap<Orbit, Vec<f32>> = HashMap::new();
+    let mut claim_coh: Vec<f64> = vec![1.0; n];
+
+    for (orbit, indices) in orbit_indices.iter() {
+        if indices.is_empty() {
+            continue;
+        }
+        let first_idx = indices[0];
+        let d = claims[first_idx].metrics.len();
+        if d == 0 {
+            orbit_scores.insert(*orbit, 1.0);
+            orbit_centroids.insert(*orbit, Vec::new());
+            continue;
+        }
+
+        let mut min_lane = vec![f32::INFINITY; d];
+        let mut max_lane = vec![f32::NEG_INFINITY; d];
+
+        for &idx in indices.iter() {
+            let m = &claims[idx].metrics;
+            for i in 0..d {
+                let v = *m.get(i).unwrap_or(&0.0);
+                if v < min_lane[i] {
+                    min_lane[i] = v;
+                }
+                if v > max_lane[i] {
+                    max_lane[i] = v;
+                }
+            }
+        }
+
+        let mut normalized: Vec<(usize, Vec<f32>)> = Vec::with_capacity(indices.len());
+        for &idx in indices.iter() {
+            let m = &claims[idx].metrics;
+            let mut norm = vec![0.0f32; d];
+            for i in 0..d {
+                let v = *m.get(i).unwrap_or(&0.0);
+                let range = max_lane[i] - min_lane[i];
+                let nv = if range > 0.0 {
+                    (v - min_lane[i]) / range
+                } else {
+                    0.0
+                };
+                norm[i] = nv;
+            }
+            normalized.push((idx, norm));
+        }
+
+        let mut centroid = vec![0.0f32; d];
+        for (_, norm) in normalized.iter() {
+            for i in 0..d {
+                centroid[i] += norm[i];
+            }
+        }
+        let len_f = normalized.len() as f32;
+        if len_f > 0.0 {
+            for v in centroid.iter_mut() {
+                *v /= len_f;
+            }
+        }
+
+        let mut good = 0u64;
+        let mut ok = 0u64;
+
+        for (idx, norm) in normalized.iter() {
+            let coh = cos_sim(norm, &centroid);
+            claim_coh[*idx] = coh;
+            if coh >= 0.92 {
+                good += 1;
+            } else if coh >= 0.85 {
+                ok += 1;
+            }
+        }
+
+        let total = normalized.len() as f64;
+        let f_good = good as f64 / total;
+        let f_ok = ok as f64 / total;
+        let orbit_raw = (f_good + 0.5 * f_ok).clamp(0.0, 1.0);
+        let orbit_score = saturate_orbit(orbit_raw);
+
+        orbit_scores.insert(*orbit, orbit_score);
+        orbit_centroids.insert(*orbit, centroid);
+    }
+
+    let mut weighted_sum = 0.0f64;
+    let mut weight_sum = 0.0f64;
+    for (orbit, score) in orbit_scores.iter() {
+        let w = orbit_weight(*orbit);
+        weighted_sum += w * score;
+        weight_sum += w;
+    }
+    let c_orbit_mean = if weight_sum > 0.0 {
+        weighted_sum / weight_sum
+    } else {
+        1.0
+    };
+
+    let mut var_sum = 0.0f64;
+    for (orbit, score) in orbit_scores.iter() {
+        let w = orbit_weight(*orbit);
+        let diff = score - c_orbit_mean;
+        var_sum += w * diff * diff;
+    }
+    let orbit_var = if weight_sum > 0.0 {
+        var_sum / weight_sum
+    } else {
+        0.0
+    };
+    let beta = 0.5;
+    let v_max = 0.25;
+    let c_orbit = c_orbit_mean * (1.0 - beta * orbit_var.min(v_max));
+
+    let mut bridge_scores: Vec<f64> = Vec::new();
+    for (idx, c) in claims.iter().enumerate() {
+        let orbit = claim_orbit[idx];
+        let mut target_orbits: Vec<Orbit> = Vec::new();
+        for r in &c.refs {
+            if let Some(&t_idx) = id_to_index.get(&r.target) {
+                let to_orbit = claim_orbit[t_idx];
+                if !target_orbits.contains(&to_orbit) {
+                    target_orbits.push(to_orbit);
+                }
+            }
+        }
+        let orbit_spread = target_orbits.len();
+        let is_bridge = matches!(c.kind, ClaimKind::CrossAnchor)
+            || matches!(orbit, Orbit::Doge | Orbit::Doodle | Orbit::Mars)
+            || orbit_spread > 1;
+        if !is_bridge {
+            continue;
+        }
+
+        let base_coh = claim_coh[idx];
+        let ref_strength = if c.refs.is_empty() {
+            0.0
+        } else {
+            c.refs
+                .iter()
+                .map(|r| r.weight as f64)
+                .sum::<f64>()
+                / c.refs.len() as f64
+        };
+        let spread_term = (orbit_spread as f64 / 3.0).min(1.0);
+        let e_bridge = 0.5 * ref_strength + 0.5 * spread_term;
+        let bridge_raw = (0.6 * base_coh + 0.4 * e_bridge).clamp(0.0, 1.0);
+        let bridge_score = saturate_bridge(bridge_raw);
+        bridge_scores.push(bridge_score);
+    }
+    let c_bridge = if bridge_scores.is_empty() {
+        1.0
+    } else {
+        bridge_scores.iter().copied().sum::<f64>() / bridge_scores.len() as f64
+    };
+
+    let mut sim_sum = 0.0f64;
+    let mut sim_count = 0u64;
+    let mut connected_orbits: HashMap<Orbit, ()> = HashMap::new();
+
+    for edge in edges {
+        let from_idx = match id_to_index.get(&edge.from) {
+            Some(i) => *i,
+            None => continue,
+        };
+        let to_idx = match id_to_index.get(&edge.to) {
+            Some(i) => *i,
+            None => continue,
+        };
+        let o1 = claim_orbit[from_idx];
+        let o2 = claim_orbit[to_idx];
+        if o1 == o2 {
+            continue;
+        }
+        let c1 = match orbit_centroids.get(&o1) {
+            Some(c) => c,
+            None => continue,
+        };
+        let c2 = match orbit_centroids.get(&o2) {
+            Some(c) => c,
+            None => continue,
+        };
+        let sim = cos_sim_slice(c1, c2);
+        sim_sum += sim;
+        sim_count += 1;
+        connected_orbits.insert(o1, ());
+        connected_orbits.insert(o2, ());
+    }
+
+    let t_pairs = if sim_count > 0 {
+        sim_sum / sim_count as f64
+    } else {
+        1.0
+    };
+
+    let total_orbits = orbit_scores.len() as f64;
+    let connected = connected_orbits.len() as f64;
+    let connectivity = if total_orbits > 0.0 {
+        (connected / total_orbits).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let t_rigid = t_pairs * connectivity;
+    let c_mesh = 0.7 * t_pairs + 0.3 * t_rigid;
+
+    let mut outliers = 0u64;
+    for coh in &claim_coh {
+        if *coh < 0.8 {
+            outliers += 1;
+        }
+    }
+    let frac = outliers as f64 / n as f64;
+    let c_guard = (1.0 - 0.5 * frac).clamp(0.7, 1.0);
+
+    let eci = 0.5 * c_orbit + 0.25 * c_bridge + 0.15 * c_mesh + 0.10 * c_guard;
+    let margin = (eci - ECI_THRESHOLD).max(0.0);
+
+    (eci, c_orbit, c_bridge, c_mesh, c_guard, margin)
 }
 
 fn claim_bytes(c: &Claim) -> Vec<u8> {
@@ -661,42 +983,6 @@ fn sparse_forest_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         h.update(leaf);
     }
     *h.finalize().as_bytes()
-}
-
-fn compute_drift(claims: &[Claim]) -> (f64, f64) {
-    if claims.len() < 2 {
-        return (0.0, 1.0);
-    }
-    let mut total = 0.0;
-    let mut good = 0u64;
-    let mut prev = &claims[0].metrics;
-    for c in &claims[1..] {
-        let cur = &c.metrics;
-        let (num, den) = drift_pair(prev, cur);
-        let d = if den > 0.0 { num / den } else { 0.0 };
-        total += d;
-        if d < 0.01 {
-            good += 1;
-        }
-        prev = cur;
-    }
-    let n = (claims.len() - 1) as f64;
-    let avg = total / n;
-    let slo = good as f64 / n;
-    (avg, slo)
-}
-
-fn drift_pair(a: &[f32], b: &[f32]) -> (f64, f64) {
-    let len = a.len().min(b.len());
-    let mut num = 0.0;
-    let mut den = 0.0;
-    for i in 0..len {
-        let v = a[i] as f64;
-        let vp = b[i] as f64;
-        num += (vp - v) * (vp - v);
-        den += v * v;
-    }
-    (num.sqrt(), den.sqrt())
 }
 
 fn entangle_edges(claims: &[Claim]) -> Vec<EntangledEdge> {
@@ -742,8 +1028,8 @@ fn pulse_glyph(forest: &EmpireForest) {
     println!("entropy anchor pulse:");
     println!("root={}", hex::encode(forest.root));
     println!(
-        "slo={:.4} drift={:.6} avg_drift={:.6}",
-        forest.slo, forest.drift, forest.avg_drift
+        "eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
+        forest.eci, forest.c_orbit, forest.c_bridge, forest.c_mesh, forest.c_guard, forest.margin
     );
     println!("[⊂∴↺ℵ] Empire Entanglement Merkle Forest online");
 }
@@ -758,8 +1044,8 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
     writeln!(f, "sparse_root={}", hex::encode(forest.sparse_root))?;
     writeln!(
         f,
-        "slo={:.4} drift={:.6} avg_drift={:.6}",
-        forest.slo, forest.drift, forest.avg_drift
+        "eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
+        forest.eci, forest.c_orbit, forest.c_bridge, forest.c_mesh, forest.c_guard, forest.margin
     )?;
     let serialized = serde_yaml::to_string(&forest.claims).unwrap_or_default();
     writeln!(f, "claims:\n{}", serialized)?;
@@ -767,7 +1053,7 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
 }
 
 fn write_anchor_svg(forest: &EmpireForest) -> Result<()> {
-    let color = if forest.slo >= SLO_THRESHOLD {
+    let color = if forest.eci >= ECI_THRESHOLD {
         "#FFC627"
     } else {
         "#7C7C88"
@@ -789,7 +1075,12 @@ fn write_anchor_svg(forest: &EmpireForest) -> Result<()> {
 <title>entropy-anchor root={root_hex}</title>
 </svg>
 ",
-        qx, qy, cx - 8, cy, cx + 8, cy
+        qx,
+        qy,
+        cx - 8,
+        cy,
+        cx + 8,
+        cy
     );
     if let Some(parent) = Path::new(GLYPH_PATH).parent() {
         fs::create_dir_all(parent)?;
@@ -825,7 +1116,8 @@ fn multi_proof_check(claims: &[Claim], leaf: [u8; 32]) -> Result<bool> {
     Ok(ok && idxs.iter().any(|&i| leaves[i] == leaf))
 }
 
-    fn hybrid_sign_root(root: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>, bool)> {    let seed = dual_leaf(root);
+fn hybrid_sign_root(root: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>, bool)> {
+    let seed = dual_leaf(root);
     let mut rng = StdRng::from_seed(seed);
     let signing_key = random_signing_key(&mut rng);
     let verifying_key = signing_key.verifying_key();

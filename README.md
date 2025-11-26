@@ -1,9 +1,14 @@
 # Ore City
 
 ## The Insanity
-Oh my god Becky, look at her back-end, it is do big, ugh
-She looks like one of those rap guys' girlfriends, but, ugh, you know
+Oh my god Becky, look at her back-end, it is so big, ugh
+She looks like one of those rap guys' applications, but, ugh, you know
+
 BABY GOT BACK --> did we really evolve the process. again. whoa. 
+
+Just getting warmed up.
+What's next, Jupyter?
+Nah, clearly, your anus.
 
 ## Thesis
 Ore City: The bypassed Route 66 ghost town resurrected as a 4.2 MB static binary that receipts the Elonverse—from Tesla VINs traced to desert veins, Boring bioreactor calories hashed to CO₂ yields, SpaceX recycled hulls fused to deluge erosion proofs, Neuralink brain-entropy signed overrides, xAI gravity-chunked swarm episodes grounded in doodle glyphs, to Starlink Mars-lag RTT histograms pinned across 20-year epochs—all entangled in a shared-node Merkle Forest DAG. Zero cloud. Local-only. Pure signal: one glyph silences ESG theater, one proof grounds Grok's worlds, one chain feeds regulators truth they can't deny. Pixar soul in cyberpunk wiring—fork the dragon, receipt the stars.
