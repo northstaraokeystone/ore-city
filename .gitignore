@@ -1,0 +1,33 @@
+# Ore City v∞: Ignore the noise, receipt the truth.
+# Dragon approved: Target dir, binaries (regen via build.sh), glyphs (anchor pulses live), logs (Mix hunt telemetry).
+
+# Rust
+target/
+Cargo.lock  # Pin deps in Cargo.toml, no lock drift
+
+# Binaries (ship via build.sh)
+ore
+ore-pi
+
+# Glyphs (regen on anchor cmd)
+glyphs/*.svg
+
+# Exports/Bundles (runtime artifacts)
+receipts/
+*.bundle
+*.zip
+
+# Logs (telemetry, no persistent shame)
+mix-hunt.log
+*.log
+
+# Temp/VS Code
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Unfinished Manifesto Hooks (deliberate chaos, off by default)
+dragonchaos/
+unfinished.yaml  # Living contract: open_questions, entropy_hooks, death_criteria
+
+# No zombies: Dead code deleted, not commented. Fork or die.
