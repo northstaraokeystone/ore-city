@@ -860,12 +860,12 @@ fn compute_rtq(
         }
         bridge_cnt += 1;
         let coh = claim_coh[idx];
-        let base = if coh >= 0.92 { 1.0 } else { 0.0 };
+        let base: f64 = if coh >= 0.92 { 1.0_f64 } else { 0.0_f64 };
         let strong_ref = c.refs.iter().any(|r| r.weight as f64 > 0.92);
-        let bonus_ref = if strong_ref { 0.05 } else { 0.0 };
+        let bonus_ref: f64 = if strong_ref { 0.05_f64 } else { 0.0_f64 };
         let dens = rle_ratio(&claim_bytes(c));
-        let bonus_density = if dens < 0.9 { 0.02 } else { 0.0 };
-        let score = (base + bonus_ref + bonus_density).min(1.0);
+        let bonus_density: f64 = if dens < 0.9_f64 { 0.02_f64 } else { 0.0_f64 };
+        let score: f64 = (base + bonus_ref + bonus_density).min(1.0_f64);
         bridge_sum += score;
     }
     let c_bridge = if bridge_cnt > 0 {
