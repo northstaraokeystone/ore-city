@@ -20,7 +20,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 static FOREST: Lazy<Result<EmpireForest>> =
     Lazy::new(|| EmpireForest::from_file("data/red-loop.yaml"));
 
-const ECI_THRESHOLD: f64 = 0.92;
+const RTQ_THRESHOLD: f64 = 0.92;
 const MIX_PHRASE: &str = "BABY GOT BACK LOOP";
 const MIX_ANAGRAM: &str = "TAL B. MAXI";
 const GLYPH_PATH: &str = "glyphs/entropy-anchor.svg";
@@ -138,13 +138,13 @@ struct EmpireForest {
     claims: Vec<Claim>,
     root: [u8; 32],
     sparse_root: [u8; 32],
-    eci: f64,
+    rtq: f64,
     c_orbit: f64,
     c_bridge: f64,
-    c_mesh: f64,
-    c_guard: f64,
+    c_rigid: f64,
     margin: f64,
     edges: Vec<EntangledEdge>,
+    orbit_scores: HashMap<Orbit, f64>,
 }
 
 // EmpireSigner trait for hot-swap
@@ -186,7 +186,7 @@ impl EmpireSigner for Ed25519Signer {
 }
 
 #[cfg(feature = "pq")]
-struct DilithiumSigner; // PQ stub
+struct DilithiumSigner;
 
 #[cfg(feature = "pq")]
 impl EmpireSigner for DilithiumSigner {
@@ -243,7 +243,7 @@ impl EmpireSigner for HybridSigner {
     }
 }
 
-// rs_merkle Hasher using dual_leaf (BLAKE3-of-[BLAKE3(data)||SHA3(data)] -> 32 bytes)
+// rs_merkle Hasher using dual_leaf
 #[derive(Clone)]
 struct DualHasher;
 
@@ -254,7 +254,7 @@ impl MerkleHasher for DualHasher {
     }
 }
 
-// Sir Mix A Lot hunt wiring (full 7 steps).
+// Sir Mix A Lot hunt wiring.
 fn main() {
     if let Err(e) = real_main() {
         eprintln!("ore error: {e}");
@@ -278,10 +278,10 @@ fn real_main() -> Result<()> {
 
 fn cmd_default() -> Result<()> {
     let forest = forest()?;
-    if forest.eci < ECI_THRESHOLD {
+    if forest.rtq < RTQ_THRESHOLD {
         return Err(format!(
-            "ECI {:.4} below threshold {:.4}",
-            forest.eci, ECI_THRESHOLD
+            "RTQ {:.4} below threshold {:.4}",
+            forest.rtq, RTQ_THRESHOLD
         )
         .into());
     }
@@ -335,16 +335,19 @@ fn cmd_verify() -> Result<()> {
         }
     }
     println!(
-        "verify: root={} sparse_root={} eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
+        "verify: root={} sparse_root={} rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
         hex::encode(forest.root),
         hex::encode(forest.sparse_root),
-        forest.eci,
+        forest.rtq,
         forest.c_orbit,
         forest.c_bridge,
-        forest.c_mesh,
-        forest.c_guard,
+        forest.c_rigid,
         forest.margin
     );
+    println!("orbit coherence:");
+    for (orbit, score) in &forest.orbit_scores {
+        println!("  {:>9}: {:.4}", orbit_name(*orbit), score);
+    }
     Ok(())
 }
 
@@ -355,8 +358,8 @@ fn cmd_receipt(full: bool) -> Result<()> {
     println!("root={}", hex::encode(forest.root));
     println!("sparse_root={}", hex::encode(forest.sparse_root));
     println!(
-        "eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
-        forest.eci, forest.c_orbit, forest.c_bridge, forest.c_mesh, forest.c_guard, forest.margin
+        "rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
+        forest.rtq, forest.c_orbit, forest.c_bridge, forest.c_rigid, forest.margin
     );
     if full {
         for c in &forest.claims {
@@ -378,14 +381,14 @@ fn cmd_anchor() -> Result<()> {
     let forest = forest()?;
     write_anchor_svg(forest)?;
     println!(
-        "anchor: glyph at {} color={} eci={:.4}",
+        "anchor: glyph at {} color={} rtq={:.4}",
         GLYPH_PATH,
-        if forest.eci >= ECI_THRESHOLD {
+        if forest.rtq >= RTQ_THRESHOLD {
             "NS_GOLD"
         } else {
             "muted"
         },
-        forest.eci
+        forest.rtq
     );
     Ok(())
 }
@@ -415,9 +418,9 @@ fn cmd_mars() -> Result<()> {
         );
     }
     println!("mars: RTT histogram leaves (ms-ish): {:?}", buckets);
-    let entanglement = forest.eci;
-    println!("mars entanglement ECI: {:.4}", entanglement);
-    if entanglement < ECI_THRESHOLD {
+    let entanglement = forest.rtq;
+    println!("mars entanglement RTQ: {:.4}", entanglement);
+    if entanglement < RTQ_THRESHOLD {
         return Err("mars entanglement below 0.92 - no pinning".into());
     }
     Ok(())
@@ -605,26 +608,27 @@ impl EmpireForest {
             .collect();
         let merkle: MerkleTree<DualHasher> = MerkleTree::from_leaves(&leaves);
         let root = merkle.root().ok_or("no merkle root")?;
-
         let sparse_root = sparse_forest_root(&leaves);
-        let edges = entangle_edges(&claims);
-        let (eci, c_orbit, c_bridge, c_mesh, c_guard, margin) = compute_eci(&claims, &edges);
 
-        if eci < ECI_THRESHOLD {
-            return Err(format!("ECI {:.4} below threshold {:.4}", eci, ECI_THRESHOLD).into());
+        let edges = entangle_edges(&claims);
+        let (rtq, c_orbit, c_bridge, c_rigid, margin, orbit_scores) =
+            compute_rtq(&claims, &edges);
+
+        if rtq < RTQ_THRESHOLD {
+            return Err(format!("RTQ {:.4} below threshold {:.4}", rtq, RTQ_THRESHOLD).into());
         }
 
         Ok(EmpireForest {
             claims,
             root,
             sparse_root,
-            eci,
+            rtq,
             c_orbit,
             c_bridge,
-            c_mesh,
-            c_guard,
+            c_rigid,
             margin,
             edges,
+            orbit_scores,
         })
     }
 }
@@ -642,15 +646,11 @@ fn orbit_for_claim(c: &Claim) -> Orbit {
         31..=35 => Orbit::Xai,
         36..=38 => Orbit::Doodle,
         39..=42 => Orbit::Mars,
-        _ => match c.kind {
-            ClaimKind::Physical => Orbit::Aux,
-            ClaimKind::Digital => Orbit::Aux,
-            ClaimKind::CrossAnchor => Orbit::Aux,
-        },
+        _ => Orbit::Aux,
     }
 }
 
-fn orbit_weight(orbit: Orbit) -> f64 {
+fn orbit_kind_weight(orbit: Orbit) -> f64 {
     match orbit {
         Orbit::Vin
         | Orbit::Optimus
@@ -658,32 +658,25 @@ fn orbit_weight(orbit: Orbit) -> f64 {
         | Orbit::Bioreactor
         | Orbit::Deluge
         | Orbit::Starlink
-        | Orbit::Mars => 1.0,
-        Orbit::Neuralink | Orbit::Xai => 0.8,
-        Orbit::Doge | Orbit::Doodle => 0.6,
-        Orbit::Aux => 0.5,
+        | Orbit::Mars => 0.6, // physical spine
+        _ => 0.4,             // digital / cross
     }
 }
 
-fn saturate_orbit(raw: f64) -> f64 {
-    let r = raw.clamp(0.0, 1.0);
-    if r <= 0.7 {
-        r * 0.8
-    } else if r <= 0.95 {
-        r
-    } else {
-        0.95 + (r - 0.95) * 0.1
-    }
-}
-
-fn saturate_bridge(raw: f64) -> f64 {
-    let r = raw.clamp(0.0, 1.0);
-    if r <= 0.8 {
-        r * 0.9
-    } else if r <= 0.95 {
-        r
-    } else {
-        0.95 + (r - 0.95) * 0.1
+fn orbit_name(o: Orbit) -> &'static str {
+    match o {
+        Orbit::Vin => "VIN",
+        Orbit::Optimus => "Optimus",
+        Orbit::Hull => "Hull",
+        Orbit::Bioreactor => "Bioreactor",
+        Orbit::Deluge => "Deluge",
+        Orbit::Doge => "Doge",
+        Orbit::Neuralink => "Neuralink",
+        Orbit::Starlink => "Starlink",
+        Orbit::Xai => "xAI",
+        Orbit::Doodle => "Doodle",
+        Orbit::Mars => "Mars",
+        Orbit::Aux => "Aux",
     }
 }
 
@@ -692,18 +685,18 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f64 {
     if len == 0 {
         return 1.0;
     }
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
     for i in 0..len {
         let ai = a[i] as f64;
         let bi = b[i] as f64;
         dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
+        na += ai * ai;
+        nb += bi * bi;
     }
-    let na = norm_a.sqrt();
-    let nb = norm_b.sqrt();
+    let na = na.sqrt();
+    let nb = nb.sqrt();
     if na > 0.0 && nb > 0.0 {
         (dot / (na * nb)).clamp(-1.0, 1.0)
     } else {
@@ -711,93 +704,127 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
-fn cos_sim_slice(a: &[f32], b: &[f32]) -> f64 {
-    cos_sim(a, b)
+fn rle_ratio(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 1.0;
+    }
+    let mut i = 0usize;
+    let mut comp = 0usize;
+    while i < bytes.len() {
+        let mut run = 1usize;
+        while i + run < bytes.len() && bytes[i + run] == bytes[i] && run < 255 {
+            run += 1;
+        }
+        comp += 2; // value + count
+        i += run;
+    }
+    comp as f64 / bytes.len() as f64
 }
 
-fn compute_eci(claims: &[Claim], edges: &[EntangledEdge]) -> (f64, f64, f64, f64, f64, f64) {
+fn compute_rtq(
+    claims: &[Claim],
+    edges: &[EntangledEdge],
+) -> (f64, f64, f64, f64, f64, HashMap<Orbit, f64>) {
     let n = claims.len();
     if n == 0 {
-        return (1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+        return (1.0, 1.0, 1.0, 1.0, 0.0, HashMap::new());
     }
 
     let mut orbit_indices: HashMap<Orbit, Vec<usize>> = HashMap::new();
-    let mut claim_orbit: Vec<Orbit> = Vec::with_capacity(n);
-    let mut id_to_index: HashMap<u32, usize> = HashMap::with_capacity(n);
-
+    let mut claim_orbit = Vec::with_capacity(n);
+    let mut id_to_index = HashMap::with_capacity(n);
     for (idx, c) in claims.iter().enumerate() {
         let o = orbit_for_claim(c);
-        claim_orbit.push(o);
         orbit_indices.entry(o).or_default().push(idx);
+        claim_orbit.push(o);
         id_to_index.insert(c.id, idx);
     }
 
-    let mut orbit_scores: HashMap<Orbit, f64> = HashMap::new();
+    let mut orbit_scores = HashMap::new();
     let mut orbit_centroids: HashMap<Orbit, Vec<f32>> = HashMap::new();
-    let mut claim_coh: Vec<f64> = vec![1.0; n];
+    let mut claim_coh = vec![1.0f64; n];
 
-    for (orbit, indices) in orbit_indices.iter() {
+    // orbit coherence: lane-normalize with log10 for small (<1) lanes
+    for (orbit, indices) in &orbit_indices {
         if indices.is_empty() {
             continue;
         }
-        let first_idx = indices[0];
-        let d = claims[first_idx].metrics.len();
+        let d = claims[indices[0]].metrics.len();
         if d == 0 {
             orbit_scores.insert(*orbit, 1.0);
             orbit_centroids.insert(*orbit, Vec::new());
             continue;
         }
 
-        let mut min_lane = vec![f32::INFINITY; d];
-        let mut max_lane = vec![f32::NEG_INFINITY; d];
-
-        for &idx in indices.iter() {
+        let mut lane_is_small = vec![true; d];
+        for &idx in indices {
             let m = &claims[idx].metrics;
             for i in 0..d {
                 let v = *m.get(i).unwrap_or(&0.0);
-                if v < min_lane[i] {
-                    min_lane[i] = v;
-                }
-                if v > max_lane[i] {
-                    max_lane[i] = v;
+                if !(v >= 0.0 && v < 1.0) {
+                    lane_is_small[i] = false;
                 }
             }
         }
 
-        let mut normalized: Vec<(usize, Vec<f32>)> = Vec::with_capacity(indices.len());
-        for &idx in indices.iter() {
+        let mut lane_min = vec![f32::INFINITY; d];
+        let mut lane_max = vec![f32::NEG_INFINITY; d];
+
+        for &idx in indices {
+            let m = &claims[idx].metrics;
+            for i in 0..d {
+                let v = *m.get(i).unwrap_or(&0.0);
+                let mut t = v;
+                if lane_is_small[i] {
+                    let x = if v <= 0.0 { 1e-9 } else { v as f64 };
+                    t = x.log10() as f32;
+                }
+                if t < lane_min[i] {
+                    lane_min[i] = t;
+                }
+                if t > lane_max[i] {
+                    lane_max[i] = t;
+                }
+            }
+        }
+
+        let mut normalized = Vec::with_capacity(indices.len());
+        for &idx in indices {
             let m = &claims[idx].metrics;
             let mut norm = vec![0.0f32; d];
             for i in 0..d {
                 let v = *m.get(i).unwrap_or(&0.0);
-                let range = max_lane[i] - min_lane[i];
-                let nv = if range > 0.0 {
-                    (v - min_lane[i]) / range
+                let mut t = v;
+                if lane_is_small[i] {
+                    let x = if v <= 0.0 { 1e-9 } else { v as f64 };
+                    t = x.log10() as f32;
+                }
+                let range = lane_max[i] - lane_min[i];
+                norm[i] = if range > 0.0 {
+                    (t - lane_min[i]) / range
                 } else {
                     0.0
                 };
-                norm[i] = nv;
             }
             normalized.push((idx, norm));
         }
 
         let mut centroid = vec![0.0f32; d];
-        for (_, norm) in normalized.iter() {
+        for (_, norm) in &normalized {
             for i in 0..d {
                 centroid[i] += norm[i];
             }
         }
         let len_f = normalized.len() as f32;
         if len_f > 0.0 {
-            for v in centroid.iter_mut() {
+            for v in &mut centroid {
                 *v /= len_f;
             }
         }
 
         let mut good = 0u64;
         let mut ok = 0u64;
-
-        for (idx, norm) in normalized.iter() {
+        for (idx, norm) in &normalized {
             let coh = cos_sim(norm, &centroid);
             claim_coh[*idx] = coh;
             if coh >= 0.92 {
@@ -808,147 +835,104 @@ fn compute_eci(claims: &[Claim], edges: &[EntangledEdge]) -> (f64, f64, f64, f64
         }
 
         let total = normalized.len() as f64;
-        let f_good = good as f64 / total;
-        let f_ok = ok as f64 / total;
-        let orbit_raw = (f_good + 0.5 * f_ok).clamp(0.0, 1.0);
-        let orbit_score = saturate_orbit(orbit_raw);
-
+        let frac_good = good as f64 / total;
+        let frac_ok = ok as f64 / total;
+        let orbit_score = (frac_good + 0.5 * frac_ok).clamp(0.0, 1.0);
         orbit_scores.insert(*orbit, orbit_score);
         orbit_centroids.insert(*orbit, centroid);
     }
 
-    let mut weighted_sum = 0.0f64;
-    let mut weight_sum = 0.0f64;
-    for (orbit, score) in orbit_scores.iter() {
-        let w = orbit_weight(*orbit);
-        weighted_sum += w * score;
-        weight_sum += w;
+    let mut w_sum = 0.0;
+    let mut ws = 0.0;
+    for (orbit, score) in &orbit_scores {
+        let w = orbit_kind_weight(*orbit);
+        ws += w * *score;
+        w_sum += w;
     }
-    let c_orbit_mean = if weight_sum > 0.0 {
-        weighted_sum / weight_sum
+    let c_orbit = if w_sum > 0.0 { ws / w_sum } else { 1.0 };
+
+    // bridges: CrossAnchor claims with ref >0.92, density +0.02, bonus +0.05
+    let mut bridge_sum = 0.0;
+    let mut bridge_cnt = 0u64;
+    for (idx, c) in claims.iter().enumerate() {
+        if !matches!(c.kind, ClaimKind::CrossAnchor) {
+            continue;
+        }
+        bridge_cnt += 1;
+        let coh = claim_coh[idx];
+        let base = if coh >= 0.92 { 1.0 } else { 0.0 };
+        let strong_ref = c.refs.iter().any(|r| r.weight as f64 > 0.92);
+        let bonus_ref = if strong_ref { 0.05 } else { 0.0 };
+        let dens = rle_ratio(&claim_bytes(c));
+        let bonus_density = if dens < 0.9 { 0.02 } else { 0.0 };
+        let score = (base + bonus_ref + bonus_density).min(1.0);
+        bridge_sum += score;
+    }
+    let c_bridge = if bridge_cnt > 0 {
+        bridge_sum / bridge_cnt as f64
     } else {
         1.0
     };
 
-    let mut var_sum = 0.0f64;
-    for (orbit, score) in orbit_scores.iter() {
-        let w = orbit_weight(*orbit);
-        let diff = score - c_orbit_mean;
-        var_sum += w * diff * diff;
-    }
-    let orbit_var = if weight_sum > 0.0 {
-        var_sum / weight_sum
+    // spectral rigidity: principal eigenvalue of orbit-centroid sim matrix
+    let mut orbit_list: Vec<Orbit> = orbit_centroids.keys().copied().collect();
+    orbit_list.sort_by_key(|o| *o as u8);
+    let m = orbit_list.len();
+    let c_rigid = if m == 0 {
+        1.0
     } else {
-        0.0
-    };
-    let beta = 0.5;
-    let v_max = 0.25;
-    let c_orbit = c_orbit_mean * (1.0 - beta * orbit_var.min(v_max));
-
-    let mut bridge_scores: Vec<f64> = Vec::new();
-    for (idx, c) in claims.iter().enumerate() {
-        let orbit = claim_orbit[idx];
-        let mut target_orbits: Vec<Orbit> = Vec::new();
-        for r in &c.refs {
-            if let Some(&t_idx) = id_to_index.get(&r.target) {
-                let to_orbit = claim_orbit[t_idx];
-                if !target_orbits.contains(&to_orbit) {
-                    target_orbits.push(to_orbit);
-                }
+        let mut mat = vec![vec![0.0f64; m]; m];
+        for i in 0..m {
+            for j in i..m {
+                let oi = orbit_list[i];
+                let oj = orbit_list[j];
+                let ci = orbit_centroids.get(&oi).unwrap();
+                let cj = orbit_centroids.get(&oj).unwrap();
+                let s = if i == j { 1.0 } else { cos_sim(ci, cj) };
+                mat[i][j] = s;
+                mat[j][i] = s;
             }
         }
-        let orbit_spread = target_orbits.len();
-        let is_bridge = matches!(c.kind, ClaimKind::CrossAnchor)
-            || matches!(orbit, Orbit::Doge | Orbit::Doodle | Orbit::Mars)
-            || orbit_spread > 1;
-        if !is_bridge {
-            continue;
+        let mut v = vec![1.0f64 / (m as f64).sqrt(); m];
+        for _ in 0..12 {
+            let mut w = vec![0.0f64; m];
+            for i in 0..m {
+                let mut acc = 0.0;
+                for j in 0..m {
+                    acc += mat[i][j] * v[j];
+                }
+                w[i] = acc;
+            }
+            let mut norm = 0.0;
+            for x in &w {
+                norm += x * x;
+            }
+            norm = norm.sqrt();
+            if norm == 0.0 {
+                break;
+            }
+            for i in 0..m {
+                v[i] = w[i] / norm;
+            }
         }
-
-        let base_coh = claim_coh[idx];
-        let ref_strength = if c.refs.is_empty() {
-            0.0
-        } else {
-            c.refs
-                .iter()
-                .map(|r| r.weight as f64)
-                .sum::<f64>()
-                / c.refs.len() as f64
-        };
-        let spread_term = (orbit_spread as f64 / 3.0).min(1.0);
-        let e_bridge = 0.5 * ref_strength + 0.5 * spread_term;
-        let bridge_raw = (0.6 * base_coh + 0.4 * e_bridge).clamp(0.0, 1.0);
-        let bridge_score = saturate_bridge(bridge_raw);
-        bridge_scores.push(bridge_score);
-    }
-    let c_bridge = if bridge_scores.is_empty() {
-        1.0
-    } else {
-        bridge_scores.iter().copied().sum::<f64>() / bridge_scores.len() as f64
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for i in 0..m {
+            let mut mv = 0.0;
+            for j in 0..m {
+                mv += mat[i][j] * v[j];
+            }
+            num += v[i] * mv;
+            den += v[i] * v[i];
+        }
+        let lambda = if den > 0.0 { num / den } else { 1.0 };
+        (lambda / m as f64).clamp(0.0, 1.0)
     };
 
-    let mut sim_sum = 0.0f64;
-    let mut sim_count = 0u64;
-    let mut connected_orbits: HashMap<Orbit, ()> = HashMap::new();
+    let rtq = 0.5 * c_orbit + 0.3 * c_bridge + 0.2 * c_rigid;
+    let margin = (rtq - RTQ_THRESHOLD).max(0.0);
 
-    for edge in edges {
-        let from_idx = match id_to_index.get(&edge.from) {
-            Some(i) => *i,
-            None => continue,
-        };
-        let to_idx = match id_to_index.get(&edge.to) {
-            Some(i) => *i,
-            None => continue,
-        };
-        let o1 = claim_orbit[from_idx];
-        let o2 = claim_orbit[to_idx];
-        if o1 == o2 {
-            continue;
-        }
-        let c1 = match orbit_centroids.get(&o1) {
-            Some(c) => c,
-            None => continue,
-        };
-        let c2 = match orbit_centroids.get(&o2) {
-            Some(c) => c,
-            None => continue,
-        };
-        let sim = cos_sim_slice(c1, c2);
-        sim_sum += sim;
-        sim_count += 1;
-        connected_orbits.insert(o1, ());
-        connected_orbits.insert(o2, ());
-    }
-
-    let t_pairs = if sim_count > 0 {
-        sim_sum / sim_count as f64
-    } else {
-        1.0
-    };
-
-    let total_orbits = orbit_scores.len() as f64;
-    let connected = connected_orbits.len() as f64;
-    let connectivity = if total_orbits > 0.0 {
-        (connected / total_orbits).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let t_rigid = t_pairs * connectivity;
-    let c_mesh = 0.7 * t_pairs + 0.3 * t_rigid;
-
-    let mut outliers = 0u64;
-    for coh in &claim_coh {
-        if *coh < 0.8 {
-            outliers += 1;
-        }
-    }
-    let frac = outliers as f64 / n as f64;
-    let c_guard = (1.0 - 0.5 * frac).clamp(0.7, 1.0);
-
-    let eci = 0.5 * c_orbit + 0.25 * c_bridge + 0.15 * c_mesh + 0.10 * c_guard;
-    let margin = (eci - ECI_THRESHOLD).max(0.0);
-
-    (eci, c_orbit, c_bridge, c_mesh, c_guard, margin)
+    (rtq, c_orbit, c_bridge, c_rigid, margin, orbit_scores)
 }
 
 fn claim_bytes(c: &Claim) -> Vec<u8> {
@@ -1028,8 +1012,8 @@ fn pulse_glyph(forest: &EmpireForest) {
     println!("entropy anchor pulse:");
     println!("root={}", hex::encode(forest.root));
     println!(
-        "eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
-        forest.eci, forest.c_orbit, forest.c_bridge, forest.c_mesh, forest.c_guard, forest.margin
+        "rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
+        forest.rtq, forest.c_orbit, forest.c_bridge, forest.c_rigid, forest.margin
     );
     println!("[⊂∴↺ℵ] Empire Entanglement Merkle Forest online");
 }
@@ -1044,8 +1028,8 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
     writeln!(f, "sparse_root={}", hex::encode(forest.sparse_root))?;
     writeln!(
         f,
-        "eci={:.4} orbit={:.4} bridge={:.4} mesh={:.4} guard={:.4} margin={:.4}",
-        forest.eci, forest.c_orbit, forest.c_bridge, forest.c_mesh, forest.c_guard, forest.margin
+        "rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
+        forest.rtq, forest.c_orbit, forest.c_bridge, forest.c_rigid, forest.margin
     )?;
     let serialized = serde_yaml::to_string(&forest.claims).unwrap_or_default();
     writeln!(f, "claims:\n{}", serialized)?;
@@ -1053,7 +1037,7 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
 }
 
 fn write_anchor_svg(forest: &EmpireForest) -> Result<()> {
-    let color = if forest.eci >= ECI_THRESHOLD {
+    let color = if forest.rtq >= RTQ_THRESHOLD {
         "#FFC627"
     } else {
         "#7C7C88"

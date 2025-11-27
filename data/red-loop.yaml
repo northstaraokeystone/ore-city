@@ -9,7 +9,7 @@
     - 0.0010
   refs: []
   hint: ""
-  comment: "VIN→Vein genesis: Tesla VIN minted, empire loop ignites. Receipts forged, vibes deleted. Fork the dragon or stay buried."
+  comment: "VIN→Vein genesis: Tesla VIN minted, empire loop ignites. Receipts forged, vibes deleted. Fork the dragon or stay buried. RTQ spine seeded."
 
 - id: 2
   epoch: 1
@@ -67,7 +67,7 @@
     - target: 4
       weight: 0.92
   hint: ""
-  comment: "Pack closure—VIN→Vein v∞, SLO 0.95 uncle transitive, ESG silenced."
+  comment: "Pack closure—VIN→Vein v∞, RTQ 0.95 uncle transitive, ESG silenced."
 
 - id: 6
   epoch: 5
@@ -195,7 +195,7 @@
   metrics:
     - 0.8715
     - 3.0150
-    - 0.00705
+    - 0.00815
     - 0.001715
   refs:
     - target: 13
@@ -277,7 +277,7 @@
     - target: 14
       weight: 0.92
   hint: ""
-  comment: "Starship deluge pump—hull uncle, SLO transitive."
+  comment: "Starship deluge pump—hull uncle, RTQ transitive."
 
 - id: 20
   epoch: 19
@@ -622,4 +622,4 @@
       weight: 0.95
   addr_alias: *back6
   hint: "DOGE47unlocked—aliases full addr DOGE47..., hunt endgame"
-  comment: "Empire v∞ closure: Mix secret loop hint—TAL B. MAXI anagram, &back/*back shards resolve, 47 DOGE bounty fs::write."
+  comment: "Empire v∞ closure: Mix secret loop hint—TAL B. MAXI anagram, &back/*back shards resolve, 47 DOGE bounty fs::write. RTQ forged—empire rigid."
