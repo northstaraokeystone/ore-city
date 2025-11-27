@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -20,7 +21,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 static FOREST: Lazy<Result<EmpireForest>> =
     Lazy::new(|| EmpireForest::from_file("data/red-loop.yaml"));
 
-const RTQ_THRESHOLD: f64 = 0.92;
+const TCQ_THRESHOLD: f64 = 0.92;
 const MIX_PHRASE: &str = "BABY GOT BACK LOOP";
 const MIX_ANAGRAM: &str = "TAL B. MAXI";
 const GLYPH_PATH: &str = "glyphs/entropy-anchor.svg";
@@ -138,10 +139,10 @@ struct EmpireForest {
     claims: Vec<Claim>,
     root: [u8; 32],
     sparse_root: [u8; 32],
-    rtq: f64,
+    tcq: f64,
     c_orbit: f64,
     c_bridge: f64,
-    c_rigid: f64,
+    c_density: f64,
     margin: f64,
     edges: Vec<EntangledEdge>,
     orbit_scores: HashMap<Orbit, f64>,
@@ -278,10 +279,10 @@ fn real_main() -> Result<()> {
 
 fn cmd_default() -> Result<()> {
     let forest = forest()?;
-    if forest.rtq < RTQ_THRESHOLD {
+    if forest.tcq < TCQ_THRESHOLD {
         return Err(format!(
-            "RTQ {:.4} below threshold {:.4}",
-            forest.rtq, RTQ_THRESHOLD
+            "TCQ {:.4} below threshold {:.4}",
+            forest.tcq, TCQ_THRESHOLD
         )
         .into());
     }
@@ -317,10 +318,15 @@ fn cmd_verify() -> Result<()> {
                     .map(|c| dual_leaf(claim_bytes(c).as_slice()))
                     .collect();
                 let tree: MerkleTree<DualHasher> = MerkleTree::from_leaves(&leaves);
-                let proof = tree.proof(&[from_idx, to_idx]);
+                let idxs = if from_idx <= to_idx {
+                    [from_idx, to_idx]
+                } else {
+                    [to_idx, from_idx]
+                };
+                let proof = tree.proof(&idxs);
                 let uncle_ok = proof.verify(
                     tree.root().ok_or("no root for uncle")?,
-                    &[from_idx, to_idx],
+                    &idxs,
                     &[
                         dual_leaf(claim_bytes(from_leaf).as_slice()),
                         dual_leaf(claim_bytes(to_leaf).as_slice()),
@@ -335,13 +341,13 @@ fn cmd_verify() -> Result<()> {
         }
     }
     println!(
-        "verify: root={} sparse_root={} rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
+        "verify: root={} sparse_root={} tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
         hex::encode(forest.root),
         hex::encode(forest.sparse_root),
-        forest.rtq,
+        forest.tcq,
         forest.c_orbit,
         forest.c_bridge,
-        forest.c_rigid,
+        forest.c_density,
         forest.margin
     );
     println!("orbit coherence:");
@@ -358,8 +364,8 @@ fn cmd_receipt(full: bool) -> Result<()> {
     println!("root={}", hex::encode(forest.root));
     println!("sparse_root={}", hex::encode(forest.sparse_root));
     println!(
-        "rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
-        forest.rtq, forest.c_orbit, forest.c_bridge, forest.c_rigid, forest.margin
+        "tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
+        forest.tcq, forest.c_orbit, forest.c_bridge, forest.c_density, forest.margin
     );
     if full {
         for c in &forest.claims {
@@ -381,14 +387,14 @@ fn cmd_anchor() -> Result<()> {
     let forest = forest()?;
     write_anchor_svg(forest)?;
     println!(
-        "anchor: glyph at {} color={} rtq={:.4}",
+        "anchor: glyph at {} color={} tcq={:.4}",
         GLYPH_PATH,
-        if forest.rtq >= RTQ_THRESHOLD {
+        if forest.tcq >= TCQ_THRESHOLD {
             "NS_GOLD"
         } else {
             "muted"
         },
-        forest.rtq
+        forest.tcq
     );
     Ok(())
 }
@@ -418,9 +424,9 @@ fn cmd_mars() -> Result<()> {
         );
     }
     println!("mars: RTT histogram leaves (ms-ish): {:?}", buckets);
-    let entanglement = forest.rtq;
-    println!("mars entanglement RTQ: {:.4}", entanglement);
-    if entanglement < RTQ_THRESHOLD {
+    let entanglement = forest.tcq;
+    println!("mars transitive TCQ: {:.4}", entanglement);
+    if entanglement < TCQ_THRESHOLD {
         return Err("mars entanglement below 0.92 - no pinning".into());
     }
     Ok(())
@@ -611,21 +617,25 @@ impl EmpireForest {
         let sparse_root = sparse_forest_root(&leaves);
 
         let edges = entangle_edges(&claims);
-        let (rtq, c_orbit, c_bridge, c_rigid, margin, orbit_scores) =
-            compute_rtq(&claims, &edges);
+        let (tcq, c_orbit, c_bridge, c_density, margin, orbit_scores) =
+            compute_tcq(&claims, &edges);
 
-        if rtq < RTQ_THRESHOLD {
-            return Err(format!("RTQ {:.4} below threshold {:.4}", rtq, RTQ_THRESHOLD).into());
+        if tcq < TCQ_THRESHOLD {
+            return Err(format!(
+                "TCQ {:.4} below threshold {:.4} (orbit={:.4} bridge={:.4} density={:.4})",
+                tcq, TCQ_THRESHOLD, c_orbit, c_bridge, c_density
+            )
+            .into());
         }
 
         Ok(EmpireForest {
             claims,
             root,
             sparse_root,
-            rtq,
+            tcq,
             c_orbit,
             c_bridge,
-            c_rigid,
+            c_density,
             margin,
             edges,
             orbit_scores,
@@ -659,7 +669,7 @@ fn orbit_kind_weight(orbit: Orbit) -> f64 {
         | Orbit::Deluge
         | Orbit::Starlink
         | Orbit::Mars => 0.6, // physical spine
-        _ => 0.4,             // digital / cross
+        _ => 0.4,             // digital / cross / aux
     }
 }
 
@@ -704,14 +714,15 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f64 {
     }
 }
 
+// RLE-style pseudo compression ratio: compressed_len / original_len
 fn rle_ratio(bytes: &[u8]) -> f64 {
     if bytes.is_empty() {
         return 1.0;
     }
-    let mut i = 0usize;
-    let mut comp = 0usize;
+    let mut i: usize = 0;
+    let mut comp: usize = 0;
     while i < bytes.len() {
-        let mut run = 1usize;
+        let mut run: usize = 1;
         while i + run < bytes.len() && bytes[i + run] == bytes[i] && run < 255 {
             run += 1;
         }
@@ -721,9 +732,10 @@ fn rle_ratio(bytes: &[u8]) -> f64 {
     comp as f64 / bytes.len() as f64
 }
 
-fn compute_rtq(
+// TCQ: 0.5 * orbit_avg + 0.3 * bridge_fraction + 0.2 * density_guard
+fn compute_tcq(
     claims: &[Claim],
-    edges: &[EntangledEdge],
+    _edges: &[EntangledEdge],
 ) -> (f64, f64, f64, f64, f64, HashMap<Orbit, f64>) {
     let n = claims.len();
     if n == 0 {
@@ -731,8 +743,9 @@ fn compute_rtq(
     }
 
     let mut orbit_indices: HashMap<Orbit, Vec<usize>> = HashMap::new();
-    let mut claim_orbit = Vec::with_capacity(n);
-    let mut id_to_index = HashMap::with_capacity(n);
+    let mut claim_orbit: Vec<Orbit> = Vec::with_capacity(n);
+    let mut id_to_index: HashMap<u32, usize> = HashMap::with_capacity(n);
+
     for (idx, c) in claims.iter().enumerate() {
         let o = orbit_for_claim(c);
         orbit_indices.entry(o).or_default().push(idx);
@@ -740,11 +753,11 @@ fn compute_rtq(
         id_to_index.insert(c.id, idx);
     }
 
-    let mut orbit_scores = HashMap::new();
+    let mut orbit_scores: HashMap<Orbit, f64> = HashMap::new();
     let mut orbit_centroids: HashMap<Orbit, Vec<f32>> = HashMap::new();
-    let mut claim_coh = vec![1.0f64; n];
+    let mut claim_coh: Vec<f64> = vec![1.0; n];
 
-    // orbit coherence: lane-normalize with log10 for small (<1) lanes
+    // 1. Orbit coherence: lane-normalize with log10 for sub-1 lanes.
     for (orbit, indices) in &orbit_indices {
         if indices.is_empty() {
             continue;
@@ -756,6 +769,7 @@ fn compute_rtq(
             continue;
         }
 
+        // Detect "small" lanes (entropy / probabilities).
         let mut lane_is_small = vec![true; d];
         for &idx in indices {
             let m = &claims[idx].metrics;
@@ -788,7 +802,7 @@ fn compute_rtq(
             }
         }
 
-        let mut normalized = Vec::with_capacity(indices.len());
+        let mut normalized: Vec<(usize, Vec<f32>)> = Vec::with_capacity(indices.len());
         for &idx in indices {
             let m = &claims[idx].metrics;
             let mut norm = vec![0.0f32; d];
@@ -810,7 +824,7 @@ fn compute_rtq(
         }
 
         let mut centroid = vec![0.0f32; d];
-        for (_, norm) in &normalized {
+        for (_idx, norm) in &normalized {
             for i in 0..d {
                 centroid[i] += norm[i];
             }
@@ -842,8 +856,9 @@ fn compute_rtq(
         orbit_centroids.insert(*orbit, centroid);
     }
 
-    let mut w_sum = 0.0;
-    let mut ws = 0.0;
+    // Weighted orbit average (physical orbits heavier).
+    let mut w_sum = 0.0_f64;
+    let mut ws = 0.0_f64;
     for (orbit, score) in &orbit_scores {
         let w = orbit_kind_weight(*orbit);
         ws += w * *score;
@@ -851,21 +866,53 @@ fn compute_rtq(
     }
     let c_orbit = if w_sum > 0.0 { ws / w_sum } else { 1.0 };
 
-    // bridges: CrossAnchor claims with ref >0.92, density +0.02, bonus +0.05
-    let mut bridge_sum = 0.0;
-    let mut bridge_cnt = 0u64;
+    // Build Merkle tree once for uncle proofs / density.
+    let leaves: Vec<[u8; 32]> = claims
+        .iter()
+        .map(|c| dual_leaf(claim_bytes(c).as_slice()))
+        .collect();
+    let tree: MerkleTree<DualHasher> = MerkleTree::from_leaves(&leaves);
+    let root = tree.root().unwrap_or([0u8; 32]);
+
+    // 2. Bridges: CrossAnchor claims, base on cos-sim, +0.05 if strong ref + uncle proof.
+    let mut bridge_sum = 0.0_f64;
+    let mut bridge_cnt: u64 = 0;
     for (idx, c) in claims.iter().enumerate() {
         if !matches!(c.kind, ClaimKind::CrossAnchor) {
             continue;
         }
         bridge_cnt += 1;
-        let coh = claim_coh[idx];
-        let base: f64 = if coh >= 0.92 { 1.0_f64 } else { 0.0_f64 };
+        let mut score = claim_coh[idx].clamp(0.0, 1.0);
+
         let strong_ref = c.refs.iter().any(|r| r.weight as f64 > 0.92);
-        let bonus_ref: f64 = if strong_ref { 0.05_f64 } else { 0.0_f64 };
-        let dens = rle_ratio(&claim_bytes(c));
-        let bonus_density: f64 = if dens < 0.9_f64 { 0.02_f64 } else { 0.0_f64 };
-        let score: f64 = (base + bonus_ref + bonus_density).min(1.0_f64);
+        let mut uncle_ok = false;
+        if let Some(&from_idx) = id_to_index.get(&c.id) {
+            for r in &c.refs {
+                if let Some(&to_idx) = id_to_index.get(&r.target) {
+                    let (a, b) = if from_idx <= to_idx {
+                        (from_idx, to_idx)
+                    } else {
+                        (to_idx, from_idx)
+                    };
+                    let idxs = [a, b];
+                    let proof = tree.proof(&idxs);
+                    let ok = proof.verify(
+                        root,
+                        &idxs,
+                        &[leaves[a], leaves[b]],
+                        leaves.len(),
+                    );
+                    if ok {
+                        uncle_ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if strong_ref && uncle_ok {
+            score = (score + 0.05_f64).min(1.0_f64);
+        }
         bridge_sum += score;
     }
     let c_bridge = if bridge_cnt > 0 {
@@ -874,65 +921,36 @@ fn compute_rtq(
         1.0
     };
 
-    // spectral rigidity: principal eigenvalue of orbit-centroid sim matrix
-    let mut orbit_list: Vec<Orbit> = orbit_centroids.keys().copied().collect();
-    orbit_list.sort_by_key(|o| *o as u8);
-    let m = orbit_list.len();
-    let c_rigid = if m == 0 {
-        1.0
+    // 3. Density guard: compression + 90th-percentile distance.
+    let mut dists: Vec<f64> = Vec::with_capacity(n);
+    for idx in 0..n {
+        let coh = claim_coh[idx].clamp(0.0, 1.0);
+        dists.push(1.0 - coh);
+    }
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let d90_index = if n == 0 {
+        0
     } else {
-        let mut mat = vec![vec![0.0f64; m]; m];
-        for i in 0..m {
-            for j in i..m {
-                let oi = orbit_list[i];
-                let oj = orbit_list[j];
-                let ci = orbit_centroids.get(&oi).unwrap();
-                let cj = orbit_centroids.get(&oj).unwrap();
-                let s = if i == j { 1.0 } else { cos_sim(ci, cj) };
-                mat[i][j] = s;
-                mat[j][i] = s;
-            }
-        }
-        let mut v = vec![1.0f64 / (m as f64).sqrt(); m];
-        for _ in 0..12 {
-            let mut w = vec![0.0f64; m];
-            for i in 0..m {
-                let mut acc = 0.0;
-                for j in 0..m {
-                    acc += mat[i][j] * v[j];
-                }
-                w[i] = acc;
-            }
-            let mut norm = 0.0;
-            for x in &w {
-                norm += x * x;
-            }
-            norm = norm.sqrt();
-            if norm == 0.0 {
-                break;
-            }
-            for i in 0..m {
-                v[i] = w[i] / norm;
-            }
-        }
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for i in 0..m {
-            let mut mv = 0.0;
-            for j in 0..m {
-                mv += mat[i][j] * v[j];
-            }
-            num += v[i] * mv;
-            den += v[i] * v[i];
-        }
-        let lambda = if den > 0.0 { num / den } else { 1.0 };
-        (lambda / m as f64).clamp(0.0, 1.0)
+        (((0.9_f64 * (n as f64)).ceil() as usize).saturating_sub(1)).min(n - 1)
     };
+    let d90 = dists[d90_index];
+    let bonus_outlier: f64 = if d90 < 0.01_f64 { 0.1_f64 } else { 0.0_f64 };
 
-    let rtq = 0.5 * c_orbit + 0.3 * c_bridge + 0.2 * c_rigid;
-    let margin = (rtq - RTQ_THRESHOLD).max(0.0);
+    let mut all_bytes = Vec::new();
+    all_bytes.reserve(n * 64);
+    for c in claims {
+        all_bytes.extend_from_slice(&claim_bytes(c));
+    }
+    let comp_ratio = rle_ratio(&all_bytes); // compressed_len / original_len
+    let gain = (1.0_f64 - comp_ratio).max(0.0_f64); // compression gain in [0,1]
+    let bonus_compress: f64 = if gain > 0.90_f64 { 0.02_f64 } else { 0.0_f64 };
+    let base_density: f64 = 0.8_f64;
+    let c_density: f64 = (base_density + bonus_compress + bonus_outlier).min(1.0_f64);
 
-    (rtq, c_orbit, c_bridge, c_rigid, margin, orbit_scores)
+    let tcq = 0.5_f64 * c_orbit + 0.3_f64 * c_bridge + 0.2_f64 * c_density;
+    let margin = (tcq - TCQ_THRESHOLD).max(0.0_f64);
+
+    (tcq, c_orbit, c_bridge, c_density, margin, orbit_scores)
 }
 
 fn claim_bytes(c: &Claim) -> Vec<u8> {
@@ -1012,8 +1030,8 @@ fn pulse_glyph(forest: &EmpireForest) {
     println!("entropy anchor pulse:");
     println!("root={}", hex::encode(forest.root));
     println!(
-        "rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
-        forest.rtq, forest.c_orbit, forest.c_bridge, forest.c_rigid, forest.margin
+        "tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
+        forest.tcq, forest.c_orbit, forest.c_bridge, forest.c_density, forest.margin
     );
     println!("[⊂∴↺ℵ] Empire Entanglement Merkle Forest online");
 }
@@ -1028,8 +1046,8 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
     writeln!(f, "sparse_root={}", hex::encode(forest.sparse_root))?;
     writeln!(
         f,
-        "rtq={:.4} orbit={:.4} bridge={:.4} rigid={:.4} margin={:.4}",
-        forest.rtq, forest.c_orbit, forest.c_bridge, forest.c_rigid, forest.margin
+        "tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
+        forest.tcq, forest.c_orbit, forest.c_bridge, forest.c_density, forest.margin
     )?;
     let serialized = serde_yaml::to_string(&forest.claims).unwrap_or_default();
     writeln!(f, "claims:\n{}", serialized)?;
@@ -1037,7 +1055,7 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
 }
 
 fn write_anchor_svg(forest: &EmpireForest) -> Result<()> {
-    let color = if forest.rtq >= RTQ_THRESHOLD {
+    let color = if forest.tcq >= TCQ_THRESHOLD {
         "#FFC627"
     } else {
         "#7C7C88"
