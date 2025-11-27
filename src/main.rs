@@ -21,7 +21,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 static FOREST: Lazy<Result<EmpireForest>> =
     Lazy::new(|| EmpireForest::from_file("data/red-loop.yaml"));
 
-const TCQ_THRESHOLD: f64 = 0.92;
+const TSR_THRESHOLD: f64 = 0.92;
 const MIX_PHRASE: &str = "BABY GOT BACK LOOP";
 const MIX_ANAGRAM: &str = "TAL B. MAXI";
 const GLYPH_PATH: &str = "glyphs/entropy-anchor.svg";
@@ -139,13 +139,13 @@ struct EmpireForest {
     claims: Vec<Claim>,
     root: [u8; 32],
     sparse_root: [u8; 32],
-    tcq: f64,
-    c_orbit: f64,
-    c_bridge: f64,
-    c_density: f64,
+    tsr: f64,
+    c_orbit: f64,      // orbit_rigidity term
+    c_bridge: f64,     // bridge_gap term
+    c_footprint: f64,  // density_footprint term
     margin: f64,
     edges: Vec<EntangledEdge>,
-    orbit_scores: HashMap<Orbit, f64>,
+    orbit_scores: HashMap<Orbit, f64>, // raw orbit coherence per orbit
 }
 
 // EmpireSigner trait for hot-swap
@@ -279,10 +279,10 @@ fn real_main() -> Result<()> {
 
 fn cmd_default() -> Result<()> {
     let forest = forest()?;
-    if forest.tcq < TCQ_THRESHOLD {
+    if forest.tsr < TSR_THRESHOLD {
         return Err(format!(
-            "TCQ {:.4} below threshold {:.4}",
-            forest.tcq, TCQ_THRESHOLD
+            "TSR {:.4} below threshold {:.4}",
+            forest.tsr, TSR_THRESHOLD
         )
         .into());
     }
@@ -341,16 +341,16 @@ fn cmd_verify() -> Result<()> {
         }
     }
     println!(
-        "verify: root={} sparse_root={} tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
+        "verify: root={} sparse_root={} tsr={:.4} orbit_rigidity={:.4} bridge_gap={:.4} density_footprint={:.4} margin={:.4}",
         hex::encode(forest.root),
         hex::encode(forest.sparse_root),
-        forest.tcq,
+        forest.tsr,
         forest.c_orbit,
         forest.c_bridge,
-        forest.c_density,
+        forest.c_footprint,
         forest.margin
     );
-    println!("orbit coherence:");
+    println!("orbit coherence (raw):");
     for (orbit, score) in &forest.orbit_scores {
         println!("  {:>9}: {:.4}", orbit_name(*orbit), score);
     }
@@ -364,8 +364,8 @@ fn cmd_receipt(full: bool) -> Result<()> {
     println!("root={}", hex::encode(forest.root));
     println!("sparse_root={}", hex::encode(forest.sparse_root));
     println!(
-        "tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
-        forest.tcq, forest.c_orbit, forest.c_bridge, forest.c_density, forest.margin
+        "tsr={:.4} orbit_rigidity={:.4} bridge_gap={:.4} density_footprint={:.4} margin={:.4}",
+        forest.tsr, forest.c_orbit, forest.c_bridge, forest.c_footprint, forest.margin
     );
     if full {
         for c in &forest.claims {
@@ -387,14 +387,14 @@ fn cmd_anchor() -> Result<()> {
     let forest = forest()?;
     write_anchor_svg(forest)?;
     println!(
-        "anchor: glyph at {} color={} tcq={:.4}",
+        "anchor: glyph at {} color={} tsr={:.4}",
         GLYPH_PATH,
-        if forest.tcq >= TCQ_THRESHOLD {
+        if forest.tsr >= TSR_THRESHOLD {
             "NS_GOLD"
         } else {
             "muted"
         },
-        forest.tcq
+        forest.tsr
     );
     Ok(())
 }
@@ -424,9 +424,9 @@ fn cmd_mars() -> Result<()> {
         );
     }
     println!("mars: RTT histogram leaves (ms-ish): {:?}", buckets);
-    let entanglement = forest.tcq;
-    println!("mars transitive TCQ: {:.4}", entanglement);
-    if entanglement < TCQ_THRESHOLD {
+    let entanglement = forest.tsr;
+    println!("mars spectral TSR: {:.4}", entanglement);
+    if entanglement < TSR_THRESHOLD {
         return Err("mars entanglement below 0.92 - no pinning".into());
     }
     Ok(())
@@ -617,13 +617,13 @@ impl EmpireForest {
         let sparse_root = sparse_forest_root(&leaves);
 
         let edges = entangle_edges(&claims);
-        let (tcq, c_orbit, c_bridge, c_density, margin, orbit_scores) =
-            compute_tcq(&claims, &edges);
+        let (tsr, c_orbit, c_bridge, c_footprint, margin, orbit_scores) =
+            compute_tsr(&claims, &edges);
 
-        if tcq < TCQ_THRESHOLD {
+        if tsr < TSR_THRESHOLD {
             return Err(format!(
-                "TCQ {:.4} below threshold {:.4} (orbit={:.4} bridge={:.4} density={:.4})",
-                tcq, TCQ_THRESHOLD, c_orbit, c_bridge, c_density
+                "TSR {:.4} below threshold {:.4} (orbit_rigidity={:.4} bridge_gap={:.4} density_footprint={:.4})",
+                tsr, TSR_THRESHOLD, c_orbit, c_bridge, c_footprint
             )
             .into());
         }
@@ -632,10 +632,10 @@ impl EmpireForest {
             claims,
             root,
             sparse_root,
-            tcq,
+            tsr,
             c_orbit,
             c_bridge,
-            c_density,
+            c_footprint,
             margin,
             edges,
             orbit_scores,
@@ -668,7 +668,7 @@ fn orbit_kind_weight(orbit: Orbit) -> f64 {
         | Orbit::Bioreactor
         | Orbit::Deluge
         | Orbit::Starlink
-        | Orbit::Mars => 0.6, // physical spine
+        | Orbit::Mars => 0.6, // physical / RTT spine
         _ => 0.4,             // digital / cross / aux
     }
 }
@@ -732,8 +732,119 @@ fn rle_ratio(bytes: &[u8]) -> f64 {
     comp as f64 / bytes.len() as f64
 }
 
-// TCQ: 0.5 * orbit_avg + 0.3 * bridge_fraction + 0.2 * density_guard
-fn compute_tcq(
+// symmetric top-two eigenvalues via power iteration + simple deflation
+fn top_two_eigs_sym(mat: &[Vec<f64>]) -> (f64, f64) {
+    let n = mat.len();
+    if n == 0 {
+        return (1.0, 1.0);
+    }
+
+    // dominant eigen
+    let mut v1 = vec![1.0f64 / (n as f64).sqrt(); n];
+    for _ in 0..16 {
+        let mut w = vec![0.0f64; n];
+        for i in 0..n {
+            let mut acc = 0.0;
+            for j in 0..n {
+                acc += mat[i][j] * v1[j];
+            }
+            w[i] = acc;
+        }
+        let mut norm = 0.0;
+        for x in &w {
+            norm += x * x;
+        }
+        if norm == 0.0 {
+            break;
+        }
+        norm = norm.sqrt();
+        for i in 0..n {
+            v1[i] = w[i] / norm;
+        }
+    }
+    let mut num1 = 0.0;
+    let mut den1 = 0.0;
+    for i in 0..n {
+        let mut mv = 0.0;
+        for j in 0..n {
+            mv += mat[i][j] * v1[j];
+        }
+        num1 += v1[i] * mv;
+        den1 += v1[i] * v1[i];
+    }
+    let lambda1 = if den1 > 0.0 { num1 / den1 } else { 1.0 };
+
+    // second eigen (orthogonal to v1)
+    let mut v2 = vec![0.0f64; n];
+    for i in 0..n {
+        v2[i] = (i as f64 + 1.0) / (n as f64 + 1.0);
+    }
+    let mut dot12 = 0.0;
+    for i in 0..n {
+        dot12 += v2[i] * v1[i];
+    }
+    for i in 0..n {
+        v2[i] -= dot12 * v1[i];
+    }
+    let mut norm2 = 0.0;
+    for x in &v2 {
+        norm2 += x * x;
+    }
+    if norm2 == 0.0 {
+        v2 = vec![0.0; n];
+        v2[0] = 1.0;
+    } else {
+        norm2 = norm2.sqrt();
+        for i in 0..n {
+            v2[i] /= norm2;
+        }
+    }
+
+    for _ in 0..16 {
+        let mut w = vec![0.0f64; n];
+        for i in 0..n {
+            let mut acc = 0.0;
+            for j in 0..n {
+                acc += mat[i][j] * v2[j];
+            }
+            w[i] = acc;
+        }
+        let mut proj = 0.0;
+        for i in 0..n {
+            proj += w[i] * v1[i];
+        }
+        for i in 0..n {
+            w[i] -= proj * v1[i];
+        }
+        let mut norm = 0.0;
+        for x in &w {
+            norm += x * x;
+        }
+        if norm == 0.0 {
+            break;
+        }
+        norm = norm.sqrt();
+        for i in 0..n {
+            v2[i] = w[i] / norm;
+        }
+    }
+
+    let mut num2 = 0.0;
+    let mut den2 = 0.0;
+    for i in 0..n {
+        let mut mv = 0.0;
+        for j in 0..n {
+            mv += mat[i][j] * v2[j];
+        }
+        num2 += v2[i] * mv;
+        den2 += v2[i] * v2[i];
+    }
+    let lambda2 = if den2 > 0.0 { num2 / den2 } else { lambda1 };
+    (lambda1, lambda2)
+}
+
+// TSR: 0.4 * orbit_rigidity + 0.3 * bridge_gap + 0.3 * density_footprint
+fn compute_tsr(
     claims: &[Claim],
     _edges: &[EntangledEdge],
 ) -> (f64, f64, f64, f64, f64, HashMap<Orbit, f64>) {
@@ -757,7 +868,7 @@ fn compute_tcq(
     let mut orbit_centroids: HashMap<Orbit, Vec<f32>> = HashMap::new();
     let mut claim_coh: Vec<f64> = vec![1.0; n];
 
-    // 1. Orbit coherence: lane-normalize with log10 for sub-1 lanes.
+    // 1. Orbit coherence: lane-normalize with log10 for sub-1 lanes per orbit.
     for (orbit, indices) in &orbit_indices {
         if indices.is_empty() {
             continue;
@@ -769,7 +880,6 @@ fn compute_tcq(
             continue;
         }
 
-        // Detect "small" lanes (entropy / probabilities).
         let mut lane_is_small = vec![true; d];
         for &idx in indices {
             let m = &claims[idx].metrics;
@@ -856,7 +966,7 @@ fn compute_tcq(
         orbit_centroids.insert(*orbit, centroid);
     }
 
-    // Weighted orbit average (physical orbits heavier).
+    // weighted orbit mean (raw)
     let mut w_sum = 0.0_f64;
     let mut ws = 0.0_f64;
     for (orbit, score) in &orbit_scores {
@@ -864,9 +974,74 @@ fn compute_tcq(
         ws += w * *score;
         w_sum += w;
     }
-    let c_orbit = if w_sum > 0.0 { ws / w_sum } else { 1.0 };
+    let orbit_mean = if w_sum > 0.0 { ws / w_sum } else { 1.0 };
 
-    // Build Merkle tree once for uncle proofs / density.
+    // spectral orbit Laplacian-ish: adjacency over orbit centroids boosted on Neuralink / xAI entropy, Starlink / Mars RTT
+    let mut orbit_list: Vec<Orbit> = orbit_centroids.keys().copied().collect();
+    orbit_list.sort_by_key(|o| *o as i32);
+    let m = orbit_list.len();
+    let mut adj = vec![vec![0.0f64; m]; m];
+
+    fn orbit_boost(o: Orbit) -> f64 {
+        match o {
+            Orbit::Neuralink | Orbit::Xai => 1.05,
+            Orbit::Starlink | Orbit::Mars => 1.05,
+            Orbit::Bioreactor => 1.03,
+            _ => 1.0,
+        }
+    }
+
+    for i in 0..m {
+        for j in i..m {
+            let oi = orbit_list[i];
+            let oj = orbit_list[j];
+            let ci = orbit_centroids.get(&oi).unwrap();
+            let cj = orbit_centroids.get(&oj).unwrap();
+            let mut s = cos_sim(ci, cj).max(0.0);
+            let boost = orbit_boost(oi) * orbit_boost(oj);
+            s *= boost;
+            adj[i][j] = s;
+            adj[j][i] = s;
+        }
+    }
+
+    let mut max_w = 0.0;
+    for i in 0..m {
+        for j in 0..m {
+            if adj[i][j] > max_w {
+                max_w = adj[i][j];
+            }
+        }
+    }
+    if max_w > 0.0 {
+        for i in 0..m {
+            for j in 0..m {
+                adj[i][j] /= max_w;
+            }
+        }
+    }
+
+    let (lambda1, lambda2) = top_two_eigs_sym(&adj);
+    let lambda1_norm = if m > 0 {
+        (lambda1 / (m as f64)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let gap = if lambda1.abs() > 1e-9 {
+        ((lambda1 - lambda2) / lambda1.abs()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    fn rigidity_curve(x: f64) -> f64 {
+        let clamped = x.clamp(0.0, 1.0);
+        (0.4 + 0.6 * clamped.sqrt()).min(1.0)
+    }
+
+    let orbit_rigidity_raw = 0.6 * orbit_mean + 0.4 * lambda1_norm;
+    let orbit_rigidity = rigidity_curve(orbit_rigidity_raw);
+
+    // Build Merkle tree for uncle proofs and density footprint.
     let leaves: Vec<[u8; 32]> = claims
         .iter()
         .map(|c| dual_leaf(claim_bytes(c).as_slice()))
@@ -874,7 +1049,7 @@ fn compute_tcq(
     let tree: MerkleTree<DualHasher> = MerkleTree::from_leaves(&leaves);
     let root = tree.root().unwrap_or([0u8; 32]);
 
-    // 2. Bridges: CrossAnchor claims, base on cos-sim, +0.05 if strong ref + uncle proof.
+    // 2. Bridges: CrossAnchor claims + spectral gap contribution
     let mut bridge_sum = 0.0_f64;
     let mut bridge_cnt: u64 = 0;
     for (idx, c) in claims.iter().enumerate() {
@@ -915,13 +1090,15 @@ fn compute_tcq(
         }
         bridge_sum += score;
     }
-    let c_bridge = if bridge_cnt > 0 {
+    let bridge_mean = if bridge_cnt > 0 {
         bridge_sum / bridge_cnt as f64
     } else {
         1.0
     };
+    let bridge_gap_raw = 0.6 * bridge_mean + 0.4 * gap;
+    let bridge_gap = rigidity_curve(bridge_gap_raw);
 
-    // 3. Density guard: compression + 90th-percentile distance.
+    // 3. Density footprint: compressibility + 90th-percentile distance
     let mut dists: Vec<f64> = Vec::with_capacity(n);
     for idx in 0..n {
         let coh = claim_coh[idx].clamp(0.0, 1.0);
@@ -934,23 +1111,23 @@ fn compute_tcq(
         (((0.9_f64 * (n as f64)).ceil() as usize).saturating_sub(1)).min(n - 1)
     };
     let d90 = dists[d90_index];
-    let bonus_outlier: f64 = if d90 < 0.01_f64 { 0.1_f64 } else { 0.0_f64 };
-
     let mut all_bytes = Vec::new();
     all_bytes.reserve(n * 64);
     for c in claims {
         all_bytes.extend_from_slice(&claim_bytes(c));
     }
     let comp_ratio = rle_ratio(&all_bytes); // compressed_len / original_len
-    let gain = (1.0_f64 - comp_ratio).max(0.0_f64); // compression gain in [0,1]
-    let bonus_compress: f64 = if gain > 0.90_f64 { 0.02_f64 } else { 0.0_f64 };
-    let base_density: f64 = 0.8_f64;
-    let c_density: f64 = (base_density + bonus_compress + bonus_outlier).min(1.0_f64);
+    let gain = (1.0_f64 - comp_ratio).clamp(0.0_f64, 1.0_f64); // 1 == very compressible
+    let density_raw = (0.7 * gain + 0.3 * (1.0 - d90)).clamp(0.0, 1.0);
+    let density_footprint = rigidity_curve(density_raw);
 
-    let tcq = 0.5_f64 * c_orbit + 0.3_f64 * c_bridge + 0.2_f64 * c_density;
-    let margin = (tcq - TCQ_THRESHOLD).max(0.0_f64);
+    let c_orbit = orbit_rigidity;
+    let c_bridge = bridge_gap;
+    let c_footprint = density_footprint;
+    let tsr = 0.4 * c_orbit + 0.3 * c_bridge + 0.3 * c_footprint;
+    let margin = (tsr - TSR_THRESHOLD).max(0.0_f64);
 
-    (tcq, c_orbit, c_bridge, c_density, margin, orbit_scores)
+    (tsr, c_orbit, c_bridge, c_footprint, margin, orbit_scores)
 }
 
 fn claim_bytes(c: &Claim) -> Vec<u8> {
@@ -1030,8 +1207,8 @@ fn pulse_glyph(forest: &EmpireForest) {
     println!("entropy anchor pulse:");
     println!("root={}", hex::encode(forest.root));
     println!(
-        "tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
-        forest.tcq, forest.c_orbit, forest.c_bridge, forest.c_density, forest.margin
+        "tsr={:.4} orbit_rigidity={:.4} bridge_gap={:.4} density_footprint={:.4} margin={:.4}",
+        forest.tsr, forest.c_orbit, forest.c_bridge, forest.c_footprint, forest.margin
     );
     println!("[⊂∴↺ℵ] Empire Entanglement Merkle Forest online");
 }
@@ -1046,8 +1223,8 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
     writeln!(f, "sparse_root={}", hex::encode(forest.sparse_root))?;
     writeln!(
         f,
-        "tcq={:.4} orbit={:.4} bridge={:.4} density={:.4} margin={:.4}",
-        forest.tcq, forest.c_orbit, forest.c_bridge, forest.c_density, forest.margin
+        "tsr={:.4} orbit_rigidity={:.4} bridge_gap={:.4} density_footprint={:.4} margin={:.4}",
+        forest.tsr, forest.c_orbit, forest.c_bridge, forest.c_footprint, forest.margin
     )?;
     let serialized = serde_yaml::to_string(&forest.claims).unwrap_or_default();
     writeln!(f, "claims:\n{}", serialized)?;
@@ -1055,7 +1232,7 @@ fn export_receipt_bundle(forest: &EmpireForest) -> Result<()> {
 }
 
 fn write_anchor_svg(forest: &EmpireForest) -> Result<()> {
-    let color = if forest.tcq >= TCQ_THRESHOLD {
+    let color = if forest.tsr >= TSR_THRESHOLD {
         "#FFC627"
     } else {
         "#7C7C88"

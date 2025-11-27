@@ -2,7 +2,7 @@
 name = "ore-city"
 version = "0.1.0"
 edition = "2021"
-description = "Ore City v∞ EMF / RTQ spectral spine"
+description = "Ore City v∞ EMF / TCQ spectral spine"
 repository = "https://github.com/northstaraokeystone/ore-city"
 
 # Musl static for ~4.2MB binary; panic=abort in profile
@@ -27,7 +27,7 @@ default = ["ed"]
 ed = []                                                      # Classic Ed25519 signer
 pq = ["pqcrypto-dilithium"]                                  # Pure PQ signer
 hybrid = ["ed", "pq"]                                        # Hybrid Ed25519 + PQ fuse
-rtq = []                                                     # Rigidity Transitivity Quotient (pure math in main.rs)
+rtq = []                                                     # Legacy feature flag; TCQ implemented in main.rs
 
 [profile.release]
 panic = "abort"
